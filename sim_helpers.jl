@@ -42,6 +42,20 @@ function train!(nn_est; snr = 0, nBatches = 1, get_channel = () -> 0.0, verbose 
     verbose && @printf "\n"
 end
 
+function init_hier!(nn_est, init_params; verbose = false)
+    for i in 1:length(init_params[:nBatches])
+        verbose && @printf "Hierarchical Learning %.0f/%.0f\n" i length(init_params[:nBatches])
+        nAntennas  = init_params[:nAntennas][i]
+        nBatches   = init_params[:nBatches][i]
+        nBatchSize = init_params[:nBatchSize][i]
+        snr        = init_params[:snrs][i]
+        train!(nn_est, snr = snr, nBatches = nBatches, get_channel = () -> init_params[:get_channel](nAntennas, nBatchSize), verbose = verbose)
+        for (alg,nn) in nn_est
+            nn_est[alg] = cntf.resize(nn, init_params[:nAntennas][i+1], learning_rate = init_params[:learning_rates][alg][i+1])
+        end
+    end
+end
+
 function evaluate(algs; snr = 0, nBatches = 1, get_channel = () -> 0.0, verbose = false)
     errs  = Dict{Symbol,Any}()
     rates = Dict{Symbol,Any}()

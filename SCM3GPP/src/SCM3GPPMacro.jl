@@ -56,13 +56,13 @@ function generate_channel(scen::SCM3GPPMacro, nAntennas; nCoherence=1,nBatches=1
         # path powers
         exponent = -1./DS*(scen.r_DS-1)/scen.r_DS;
         Z = randn(scen.nPaths)*3; #per path shadow fading in dB
-        p = exp(exponent*tau).*(10.^(0.1*Z));
+        p = exp.(exponent*tau).*(10.^(0.1*Z));
         p = p./sum(p);
 
         # path AoDs
         AS = 10.^(scen.mu_AS + scen.eps_AS*randn());
         aodsm = randn(scen.nPaths)*scen.r_AS*AS;
-        ixs = sortperm(abs(aodsm));
+        ixs = sortperm(abs.(aodsm));
         aodsm = aodsm[ixs];
 
 

@@ -1,4 +1,4 @@
-type ConvNN
+mutable struct ConvNN
     reg_coeff
     learning_rate
     transform
@@ -18,14 +18,18 @@ type ConvNN
 end
 
 """
-    ConvNN(nLayers, nFilterLength; learning_rate=1e-3,reg_coeff=1e-6,activation=nn.relu)
+    ConvNN(nLayers::Integer, nAntennas::Integer; transform = (x,_) -> x, learning_rate=1e-3,reg_coeff=1e-6,activation=nn.relu)
 
-Input and output of the NN are complex-valued vectors of dimension `nCoherence, nFilterLength`.
+Input and output of the NN are complex-valued vectors of dimension `nCoherence, nFilterLength`
+where `nFilterLength` is calculated from `nAntennas` and `transform`.
 For mini-batch training, these are stacked into three dimensional arrays of dimension
 `nBatches, nCoherence, nFilterLength`.
 This method performs a random initialization of all kernels and biases.
 """
-function ConvNN(nLayers::Integer, nFilterLength::Integer; transform = (x,_) -> x, learning_rate=1e-3,reg_coeff=1e-6,activation=nn.relu)
+function ConvNN(nLayers::Integer, nAntennas::Integer; transform = (x,_) -> x, learning_rate=1e-3,reg_coeff=1e-6,activation=nn.relu)
+
+    nFilterLength = size(transform(eye(nAntennas), :notransp),1)
+    
     kernels = [rand(TruncatedNormal(0,0.1,-0.3,0.3), nFilterLength) for i in 1:nLayers]
     biases  = [0.1*ones(nFilterLength) for i in 1:nLayers]
     
@@ -75,28 +79,32 @@ function ConvNN(kernels::Array{TensorFlow.Variables.Variable}, biases::Array{Ten
     # The output of the NN is an element-wise multiplication of the filter with the input data
     est.x = reshape(filt, [nBatches, 1, nFilterLength]) .* est.y # dims: nBatches, nCoherence, nFilterLength
 
-
     # Set learning parameters
     regu = reduce_mean(square(kernels[1])) # regularization term
     for i in 2:nLayers
         regu = regu + reduce_mean(square(kernels[i]))
     end
-    cost_function = reduce_mean(square(real(est.x-est.x0)) + square(imag(est.x-est.x0))) + (est.reg_coeff*regu)
-    opt_alg       = tf.train.AdamOptimizer(est.learning_rate)
-    est.train_step = tf.train.minimize(opt_alg,cost_function) 
+    cost_function  = reduce_mean(square(real(est.x-est.x0)) + square(imag(est.x-est.x0))) + (est.reg_coeff*regu)
+    opt_alg        = tf.train.AdamOptimizer(est.learning_rate)
+    est.train_step = tf.train.minimize(opt_alg,cost_function)
 
     est.sess = Session()
     init = global_variables_initializer()
     run(est.sess,init)
 
+    # close TF-session when network is de-referenced
+    # note: All nodes remain in the graph. To reset the graph, restart julia.
+    finalizer(est, est -> close(est.sess))
     est
 end
 
 # This method takes a (smaller) network as input and interpolates
 # the values of the kernels and biases to the (larger) new filter length.
 # The TF session of the smaller network is then closed.
-function resize( est::ConvNN, nFilterLength::Integer; learning_rate=1e-3,reg_coeff=1e-6 )
-    nLayers = length(est.kernels)
+function resize( est::ConvNN, nAntennas::Integer; learning_rate=1e-3,reg_coeff=1e-6 )
+
+    nLayers          = length(est.kernels)
+    nFilterLength    = size(est.transform(eye(nAntennas), :notransp),1)
     nFilterLengthOld = get(get_shape(est.kernels[1]).dims[1])    
     kernels = Array{TensorFlow.Variables.Variable}(nLayers)
     biases  = Array{TensorFlow.Variables.Variable}(nLayers)
@@ -112,10 +120,9 @@ function resize( est::ConvNN, nFilterLength::Integer; learning_rate=1e-3,reg_coe
         bias   = bias_old_itp[  linspace(1,nFilterLengthOld,nFilterLength)]
         
         kernels[i] = Variable(Float32.(kernel[:])) # dims: nFilterLength
-        biases[i]  = Variable(Float32.(bias[:])) # dims: nFilterLength
+        biases[i]  = Variable(Float32.(bias[:]))   # dims: nFilterLength
     end
 
-    #    close(est.sess) # close not implemented for Julia
     # create new network and overwrite reference to old network
     ConvNN(kernels, biases, transform = est.transform, learning_rate=learning_rate, reg_coeff=reg_coeff, activation=est.activation)
 end
@@ -125,10 +132,6 @@ function train!(est::ConvNN, y, x0)
 end
 function estimate(est::ConvNN, y)
     x = est.transform( cnn_perm(run(est.sess, est.x, Dict([(est.y, cnn_perm(est.transform(y,:notransp)))]))), :transp)
-end
-function set_learning_rate(est::ConvNN, learning_rate::Real) 
-    est.learning_rate = learning_rate
-    est.adam.η = learning_rate
 end
 
 #

@@ -5,9 +5,9 @@ type MLEst
     MLEst() = new()
 end
 
-function MLEst(rho; transform = (x,_) -> x)
+function MLEst(snr; transform = (x,_) -> x)
     est = MLEst()
-    est.rho = rho
+    est.rho = 10^(0.1*snr);
     est.transform = transform
     est
 end

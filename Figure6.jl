@@ -1,3 +1,10 @@
+#
+# Run this file to generate Figure 6 in
+#
+#   D. Neumann, T. Wiese, and W. Utschick, Learning the MMSE Channel Estimator,
+#   IEEE Transactions on Signal Processing, 2018.
+#
+
 push!(LOAD_PATH,".")
 using DataFrames
 using CSV
@@ -14,19 +21,17 @@ verbose = true
 #
 write_file = true
 filename   = "results/figure6.csv"
-nBatches   = 50
+nBatches   = 100
 nBatchSize = 100
 
 #-------------------------------------
 # Channel Model
 #
 snr        = 0 # [dB]
-rho        = 10^(0.1*snr);
 antennas   = [8,16,32,64,96,128]
 AS         = 2.0 # standard deviation of Laplacian (angular spread)
-nPaths     = 3
 nCoherence = 1
-Channel    = scm.SCMMulti(pathAS=AS, nPaths=nPaths)
+Channel    = scm.SCMMulti(pathAS=AS, nPaths=3)
 # method that generates "nBatches" channel realizations
 get_channel(nAntennas, nCoherence, nBatches) = scm.generate_channel(Channel, nAntennas, nCoherence=nCoherence, nBatches = nBatches)
 # method that samples C_delta from delta prior
@@ -37,88 +42,60 @@ get_circ_cov_generator(nAntennas) = real(scm.best_circulant_approximation(scm.sc
 #-------------------------------------
 # Learning Algorithm parameters
 #
-learning_rates = 2e-4*128./antennas # make learning rates dependend on nAntennas
-nLayers        = 2
-nLearningBatches   = 8000
+learning_rates_relu    = 1e-4*64./antennas # make learning rates dependend on nAntennas
+learning_rates_softmax = 1e-3*ones(antennas)
+nLayers = 2
+nLearningBatches   = 6000
 nLearningBatchSize = 20
-# cnn_use_resize: networks with more antennas are initialized from networks with
-#   less antennas (only effective if cnn_load_and_save is false or no file found)
-cnn_use_resize    = true
-# save network variable values
-cnn_load_and_save = false
-cnn_filename(alg,nAntennas) = @sprintf "results/%s_nPaths%.0f_nCoherence%.0f_AS%.1f_snr%.0f_nAntennas%.0f.jld" alg nPaths nCoherence AS snr nAntennas
-
-
 
 results = DataFrame()
-algs       = Dict{Symbol,Any}()
-nn_est     = Dict{Symbol,Any}()
-nn_files   = Dict{Symbol,String}()
-cn_est     = Dict{Symbol,Any}()
+# read results from previous run
+if isfile(filename)
+    results = CSV.read(filename)
+end
+
+srand(size(results,1)) # use number of entries in results as seed for random number generator
+nn_est = Dict{Symbol,Any}()
 for iAntenna in 1:length(antennas)
     nAntennas     = antennas[iAntenna]
-    learning_rate = learning_rates[iAntenna]
 
     verbose && println("Simulating with ", nAntennas, " antennas")
 
     # Conditionally normal estimators
-    cn_est[:FastMMSE]     = mmse.FastMMSE(snr, get_circ_cov_generator(nAntennas))
-    cn_est[:CircMMSE]     = mmse.StructuredMMSE(snr, () -> get_cov(nAntennas), nSamples=16*nAntennas, transform = circ_trans)
-    cn_est[:ToepMMSE]     = mmse.StructuredMMSE(snr, () -> get_cov(nAntennas), nSamples=16*nAntennas, transform = toep_trans)
-#    cn_est[:DiscreteMMSE] = mmse.DiscreteMMSE(snr,   () -> get_cov(nAntennas), nSamples=16*nAntennas)
-    cn_est[:CircML]       = mmse.MLEst(rho, transform = circ_trans)
+    cn_est = Dict{Symbol,Any}()
+    cn_est[:FastMMSE] = mmse.FastMMSE(snr, get_circ_cov_generator(nAntennas))
+    cn_est[:CircMMSE] = mmse.StructuredMMSE(snr, () -> get_cov(nAntennas), nSamples=16*nAntennas, transform = circ_trans)
+    cn_est[:ToepMMSE] = mmse.StructuredMMSE(snr, () -> get_cov(nAntennas), nSamples=16*nAntennas, transform = toep_trans)
+    cn_est[:CircML]   = mmse.MLEst(snr, transform = circ_trans)
+
+    # Network estimators
+    if iAntenna == 1
+        nn_est[:CircReLU] = cntf.ConvNN(nLayers, nAntennas, transform = circ_trans, learning_rate = learning_rates_relu[iAntenna])
+        nn_est[:ToepReLU] = cntf.ConvNN(nLayers, nAntennas, transform = toep_trans, learning_rate = learning_rates_relu[iAntenna])
+        nn_est[:CircSoftmax] = cntf.ConvNN(nLayers, nAntennas, transform = circ_trans, learning_rate = learning_rates_softmax[iAntenna], activation = cntf.nn.softmax)
+        nn_est[:ToepSoftmax] = cntf.ConvNN(nLayers, nAntennas, transform = toep_trans, learning_rate = learning_rates_softmax[iAntenna], activation = cntf.nn.softmax)
+    else
+        nn_est[:CircReLU]    = cntf.resize(nn_est[:CircReLU],    nAntennas, learning_rate = learning_rates_relu[iAntenna])
+        nn_est[:ToepReLU]    = cntf.resize(nn_est[:ToepReLU],    nAntennas, learning_rate = learning_rates_relu[iAntenna])
+        nn_est[:CircSoftmax] = cntf.resize(nn_est[:CircSoftmax], nAntennas, learning_rate = learning_rates_softmax[iAntenna])
+        nn_est[:ToepSoftmax] = cntf.resize(nn_est[:ToepSoftmax], nAntennas, learning_rate = learning_rates_softmax[iAntenna])
+    end
+
+    train!(nn_est, snr = snr, nBatches = nLearningBatches, get_channel = () -> get_channel(nAntennas, nCoherence, nLearningBatchSize), verbose = verbose)
+
+    algs = Dict{Symbol,Any}()
+    algs[:GenieMMSE] = (y,h,h_cov) -> mmse_genie(y, h_cov, snr)
+    algs[:GenieOMP]  = (y,h,h_cov) -> omp_genie(y, h)
     for (alg,cn) in cn_est
         algs[alg] = (y,h,h_cov) -> mmse.estimate(cn, y)
     end
-    algs[:GenieMMSE] = (y,h,h_cov) -> mmse_genie(y, h_cov, snr)
-    algs[:GenieOMP]  = (y,h,h_cov) -> omp_genie(y, h)
-
-
-    # Network estimators
-    if iAntenna == 1 || !cnn_use_resize
-        nn_est[:CircReLU] = cntf.ConvNN(nLayers, nAntennas,  transform = circ_trans, learning_rate = learning_rate)
-        nn_est[:ToepReLU] = cntf.ConvNN(nLayers, 2nAntennas, transform = toep_trans, learning_rate = learning_rate)
-
-        # Initialize CircSoftmax NN with kernel and bias from Fast MMSE
-        c = get_circ_cov_generator(nAntennas)
-        w = c./(c .+ (1/rho))
-        bias    = sum(log.(1 .- w)) * nCoherence
-        biases  = [bias * ones(nAntennas), zeros(nAntennas)]
-        kernels = [w*nCoherence*rho, w[end:-1:1]]
-        nn_est[:CircSoftmax] = cntf.ConvNN(kernels, biases,  transform = circ_trans, activation = cntf.nn.softmax, learning_rate = learning_rate)
-        nn_est[:ToepSoftmax] = cntf.ConvNN(nLayers, 2nAntennas, transform = toep_trans, activation = cntf.nn.softmax, learning_rate = learning_rate)
-    elseif cnn_use_resize
-        nn_est[:CircReLU] = cntf.resize(nn_est[:CircReLU], nAntennas, learning_rate = learning_rate)
-        nn_est[:ToepReLU] = cntf.resize(nn_est[:ToepReLU], 2nAntennas, learning_rate = learning_rate)
-        nn_est[:CircSoftmax] = cntf.resize(nn_est[:CircSoftmax], nAntennas, learning_rate = learning_rate)
-        nn_est[:ToepSoftmax] = cntf.resize(nn_est[:ToepSoftmax], 2nAntennas, learning_rate = learning_rate)
-    end
-
-    if cnn_load_and_save
-        nn_files[:CircReLU] = cnn_filename("CircReLU",  nAntennas)
-        nn_files[:ToepReLU] = cnn_filename("ToepReLU", nAntennas)
-        nn_files[:CircSoftmax] = cnn_filename("CircSoftmax",  nAntennas)
-        nn_files[:ToepSoftmax] = cnn_filename("ToepSoftmax", nAntennas)
-        for (alg,nn) in nn_est
-            cntf.load!(nn, nn_files[alg])
-        end
-    end
-    train!(nn_est, snr = snr, nBatches = nLearningBatches, get_channel = () -> get_channel(nAntennas, nCoherence, nLearningBatchSize), verbose = verbose)
-    if cnn_load_and_save
-        for (alg,nn) in nn_est
-            cntf.save(nn, nn_files[alg])
-        end
-    end
     for (alg,nn) in nn_est
-        algs[alg] = (y,h,h_cov) -> cntf.estimate(nn,  y)
+        algs[alg] = (y,h,h_cov) -> cntf.estimate(nn, y)
     end
-
 
     (errs,rates) = evaluate(algs, snr = snr, nBatches = nBatches, get_channel = () -> get_channel(nAntennas, nCoherence, nBatchSize), verbose = verbose)
 
     for alg in keys(algs)
-        @show alg
-        @show errs[alg]
         new_row = DataFrame(MSE        = errs[alg],
                             rate       = rates[alg],
                             Algorithm  = alg,
@@ -136,12 +113,5 @@ for iAntenna in 1:length(antennas)
     if write_file
         CSV.write(filename, results)
     end
+    @show results
 end
-
-
-# function plot_results()
-#     for alg in keys(algs)
-#         plot(antennas, results[results[:Algorithm] .== alg, :MSE], label=alg)
-#     end
-#     legend()
-# end

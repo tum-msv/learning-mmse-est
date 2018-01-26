@@ -1,3 +1,15 @@
+#
+# Each time this file is executed, two lines will be appended to
+# 'results/figure4.csv'. Run 50 times to generate a boxplot similar
+# to the one in
+#
+#   D. Neumann, T. Wiese, and W. Utschick, Learning the MMSE Channel Estimator,
+#   IEEE Transactions on Signal Processing, 2018.
+#
+# (Closing Julia in between runs will ensure that the TensorFlow graph is
+# reset and that memory is freed up after each run.)
+#
+
 push!(LOAD_PATH,".")
 using DataFrames
 using CSV
@@ -14,20 +26,16 @@ verbose = true
 #
 write_file = true
 filename   = "results/figure4.csv"
-nBatches   = 50
+nBatches   = 100
 nBatchSize = 100
-nMC        = 50
 
 #-------------------------------------
 # Channel Model
 #
 snr        = 0 # [dB]
-rho        = 10^(0.1*snr);
-antennas   = [64,128]
 AS         = 2.0 # standard deviation of Laplacian (angular spread)
-nPaths     = 3
 nCoherence = 1
-Channel    = scm.SCMMulti(pathAS=AS, nPaths=nPaths)
+Channel    = scm.SCMMulti(pathAS=AS, nPaths=3)
 # method that generates "nBatch" channel realizations
 get_channel(nAntennas, nCoherence, nBatches) = scm.generate_channel(Channel, nAntennas, nCoherence=nCoherence, nBatches = nBatches)
 # method that samples C_delta from delta prior
@@ -38,78 +46,84 @@ get_circ_cov_generator(nAntennas) = real(scm.best_circulant_approximation(scm.sc
 #-------------------------------------
 # Learning Algorithm parameters
 #
-learning_rates = 2e-4*128./antennas # make learning rates dependend on nAntennas
-nLayers        = 2
-nLearningBatches   = 2000
+nLayers = 2
+nLearningBatches   = 6000
 nLearningBatchSize = 20
-nLearningAntennas = [ [8;16;32;64], [8;16;32;64;128] ]
-learning_rates    = 1e-4*nLearningAntennas/64 # make learning rates dependend on nAntennas
+
+init_params = Vector{Any}(2)
+
+init_params[1] = Dict{Symbol,Any}()
+init_params[1][:nAntennas]   = [   8;  16;  32;  64]
+init_params[1][:nBatches]    = [1000;1000;1000]
+init_params[1][:nBatchSize]  = [  20;  20;  20]
+init_params[1][:snrs]        = [ snr; snr; snr]
+init_params[1][:get_channel] = (nAntennas,nBatches) -> get_channel(nAntennas, nCoherence, nBatches)
+init_params[1][:learning_rates] = Dict{Symbol,Vector{Float64}}()
+init_params[1][:learning_rates][:CircReLUHier] = 1e-4*64./init_params[1][:nAntennas]
+
+init_params[2] = Dict{Symbol,Any}()
+init_params[2][:nAntennas]   = [   8;  16;  32;  64; 128]
+init_params[2][:nBatches]    = [1000;1000;1000;2000]
+init_params[2][:nBatchSize]  = [  20;  20;  20;  20]
+init_params[2][:snrs]        = [ snr; snr; snr; snr]
+init_params[2][:get_channel] = (nAntennas,nBatches) -> get_channel(nAntennas, nCoherence, nBatches)
+init_params[2][:learning_rates] = Dict{Symbol,Vector{Float64}}()
+init_params[2][:learning_rates][:CircReLUHier] = 1e-4*64./init_params[2][:nAntennas]
+
+df = DataFrame()
+# read results from previous run
+if isfile(filename)
+    df = CSV.read(filename)
+end
+
+srand(size(df,1)) # use number of entries in results as seed for random number generator
 
 results = DataFrame()
-algs   = Dict{Symbol,Any}()
-nn_est = Dict{Symbol,Any}()
-nn_est_hier = Dict{Symbol,Any}()
+for i in 1:length(init_params)
+    nAntennas = init_params[i][:nAntennas][end]
 
-for iMC in 1:nMC
-    verbose && println("Simulating Monte Carlo iteration ", iMC, "/", nMC)
-    for iAntenna in 1:length(antennas)
-        nAntennas     = antennas[iAntenna]
+    # Network estimators
+    nn_est = Dict{Symbol,Any}()
+    nn_est[:CircReLU] = cntf.ConvNN(nLayers, init_params[i][:nAntennas][end],
+                                    transform = circ_trans,
+                                    learning_rate = init_params[i][:learning_rates][:CircReLUHier][end])
+    nn_est_hier = Dict{Symbol,Any}()
+    nn_est_hier[:CircReLUHier] = cntf.ConvNN(nLayers, init_params[i][:nAntennas][1],
+                                             transform = circ_trans,
+                                             learning_rate = init_params[i][:learning_rates][:CircReLUHier][1])
 
+    # Hierarchical training:
+    init_hier!(nn_est_hier, init_params[i], verbose = verbose)
+    train!(nn_est_hier, snr = snr, nBatches = nLearningBatches, get_channel = () -> get_channel(nAntennas, nCoherence, nLearningBatchSize), verbose = verbose)
 
-        # Network estimators
-        nn_est_hier[:CircReLUHier] = cntf.ConvNN(nLayers, nLearningAntennas[iAntenna][1],  transform = circ_trans, learning_rate = learning_rates[iAntenna][1])
-        nn_est_hier[:ToepReLUHier] = cntf.ConvNN(nLayers, 2nLearningAntennas[iAntenna][1], transform = toep_trans, learning_rate = learning_rates[iAntenna][1])
+    train!(nn_est, snr = snr, nBatches = nLearningBatches + sum(init_params[i][:nBatches]), get_channel = () -> get_channel(nAntennas, nCoherence, nLearningBatchSize), verbose = verbose)    
+    
+    algs = Dict{Symbol,Any}()
+    for (alg,nn) in nn_est
+        algs[alg] = (y,h,h_cov) -> cntf.estimate(nn, y)
+    end
+    for (alg,nn) in nn_est_hier
+        algs[alg] = (y,h,h_cov) -> cntf.estimate(nn, y)
+    end
 
-        # Hierarchical training:
-        # Initial training for networks with few antennas
-        train!(nn_est_hier, snr = snr, nBatches = nLearningBatches, get_channel = () -> get_channel(nLearningAntennas[iAntenna][1], nCoherence, nLearningBatchSize), verbose = verbose)
-        for i in 2:length(nLearningAntennas[iAntenna])
-            nn_est_hier[:CircReLUHier] = cntf.resize(nn_est_hier[:CircReLUHier], nLearningAntennas[iAntenna][i], learning_rate = learning_rates[iAntenna][i])
-            nn_est_hier[:ToepReLUHier] = cntf.resize(nn_est_hier[:ToepReLUHier], 2nLearningAntennas[iAntenna][i], learning_rate = learning_rates[iAntenna][i])
-            train!(nn_est_hier, snr = snr, nBatches = nLearningBatches, get_channel = () -> get_channel(nLearningAntennas[iAntenna][i], nCoherence, nLearningBatchSize), verbose = verbose)
-        end
+    (errs,rates) = evaluate(algs, snr = snr, nBatches = nBatches, get_channel = () -> get_channel(nAntennas, nCoherence, nBatchSize), verbose = verbose)
 
-        # Non-hierarchical training (use more batches so as
-        # to keep the total number of training iterations constant):
-        nn_est[:CircReLU] = cntf.ConvNN(nLayers, nAntennas,  transform = circ_trans, learning_rate = learning_rates[iAntenna][end])
-        nn_est[:ToepReLU] = cntf.ConvNN(nLayers, 2nAntennas, transform = toep_trans, learning_rate = learning_rates[iAntenna][end])
-        train!(nn_est, snr = snr, nBatches = length(nLearningAntennas[iAntenna])*nLearningBatches, get_channel = () -> get_channel(nAntennas, nCoherence, nLearningBatchSize), verbose = verbose)
+    for alg in keys(algs)
+        new_row = DataFrame(MSE        = errs[alg],
+                            rate       = rates[alg],
+                            Algorithm  = alg,
+                            SNR        = snr, 
+                            nAntennas  = nAntennas,
+                            nCoherence = nCoherence)
 
-        for (alg,nn) in nn_est
-            algs[alg] = (y,h,h_cov) -> cntf.estimate(nn,  y)
-        end
-        for (alg,nn) in nn_est_hier
-            algs[alg] = (y,h,h_cov) -> cntf.estimate(nn,  y)
-        end
-
-        (errs,rates) = evaluate(algs, snr = snr, nBatches = nBatches, get_channel = () -> get_channel(nAntennas, nCoherence, nBatchSize), verbose = verbose)
-
-        for alg in keys(algs)
-            @show alg
-            @show errs[alg]
-            new_row = DataFrame(MSE        = errs[alg],
-                                rate       = rates[alg],
-                                Algorithm  = alg,
-                                SNR        = snr, 
-                                nAntennas  = nAntennas,
-                                nCoherence = nCoherence)
-
-            if isempty(results)
-                results = new_row
-            else
-                results = vcat(results,new_row)
-            end
-        end
-
-        if write_file
-            CSV.write(filename, results)
+        if isempty(results)
+            results = new_row
+        else
+            results = vcat(results,new_row)
         end
     end
 end
-
-# function plot_results()
-#     for alg in keys(algs)
-#         plot(antennas, results[results[:Algorithm] .== alg, :MSE], label=alg)
-#     end
-#     legend()
-# end
+@show results
+if write_file
+    CSV.write(filename, results, append=true)
+end
