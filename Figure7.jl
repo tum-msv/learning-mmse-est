@@ -117,7 +117,7 @@ for iSNR in 1:length(snrs)
     for alg in keys(algs)
         new_row = DataFrame(MSE        = errs[alg],
                             rate       = rates[alg],
-                            Algorithm  = alg,
+                            Algorithm  = String(alg),
                             SNR        = snr, 
                             nAntennas  = nAntennas,
                             nCoherence = nCoherence)
