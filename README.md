@@ -15,7 +15,7 @@ Numerical simulations with typical spatial channel models demonstrate the genera
 
 ## Installation Notes
 This code is written in _Julia_ (http://julialang.org) and uses _Julia_'s _TensorFlow_ package, which automatically installs _TensorFlow_ (http://tensorflow.org).
-The code was tested with _Julia_ version 0.6, _TensorFlow_ version 1.4.1, and version 0.7.6 of the _Julia_ package _TensorFlow_.
+The code was tested with _Julia_ version 0.6, _TensorFlow_ version 1.4.1, and version 0.8 of the _Julia_ package _TensorFlow_.
 
 ## License
 This code is licensed under 3-clause BSD License:
